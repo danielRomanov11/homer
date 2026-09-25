@@ -63,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
         console.print("[dim]Using default PRD weights (not enough graded history yet).[/dim]")
 
     console.print(f"[dim]Building slate for {slate_date.isoformat()}...[/dim]")
+    console.print(
+        "[dim]Loading season baselines + ~35-day form (first run may take a bit)...[/dim]"
+    )
 
     try:
         rows, ctx = build_batter_slate(slate_date)

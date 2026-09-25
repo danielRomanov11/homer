@@ -54,6 +54,7 @@ class PitcherInfo:
     barrel_pct: float = 7.0
     fb_pct: float = 35.0
     ff_usage: float = 40.0
+    form_factor: float = 1.0
 
 
 @dataclass
@@ -76,6 +77,7 @@ class BatterRow:
     hard_hit_pct: float = 40.0
     fb_pct: float = 35.0
     batter_vs_ff: float = 0.0
+    form_factor: float = 1.0
 
 
 @dataclass
@@ -86,6 +88,8 @@ class SlateContext:
     pitchers_df: pd.DataFrame
     bullpen_by_team: dict[str, dict[str, float]]
     people: dict[int, dict[str, Any]] = field(default_factory=dict)
+    batter_form_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    pitcher_form_df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def _get_json(url: str, params: dict | None = None, retries: int = 3) -> dict:
@@ -735,6 +739,15 @@ def build_batter_slate(slate_date: date | None = None) -> tuple[list[BatterRow],
     venues = load_venues()
     bas_season = baseline_season_for(slate_date)
     batters_df, pitchers_df, bullpen = refresh_statcast_cache(bas_season)
+
+    # Recent form (process metrics); neutral 1.0 if Statcast window unavailable
+    from .form import batter_form_factor, load_form_tables, pitcher_form_factor
+
+    try:
+        batter_form_df, pitcher_form_df = load_form_tables(slate_date)
+    except Exception:  # noqa: BLE001
+        batter_form_df, pitcher_form_df = pd.DataFrame(), pd.DataFrame()
+
     games = fetch_schedule(slate_date)
 
     # Collect ids for people hydrate
@@ -809,6 +822,13 @@ def build_batter_slate(slate_date: date | None = None) -> tuple[list[BatterRow],
                 bullpen,
                 opp_team=opp_abbr,
             )
+            pitcher.form_factor = pitcher_form_factor(
+                pitcher.id,
+                pitcher.hr9,
+                pitcher.barrel_pct,
+                pitcher.fb_pct,
+                pitcher_form_df,
+            )
 
             for slot, player in enumerate(players, start=1):
                 batter_id = int(player.get("id") or 0)
@@ -822,6 +842,13 @@ def build_batter_slate(slate_date: date | None = None) -> tuple[list[BatterRow],
                     bat_side = "L" if pitcher.hand == "R" else "R"
 
                 metrics = _batter_metrics(batter_id, batters_df)
+                b_form = batter_form_factor(
+                    batter_id,
+                    metrics["barrel_pct"],
+                    metrics["hard_hit_pct"],
+                    metrics["fb_pct"],
+                    batter_form_df,
+                )
                 rows.append(
                     BatterRow(
                         player_id=batter_id,
@@ -842,6 +869,7 @@ def build_batter_slate(slate_date: date | None = None) -> tuple[list[BatterRow],
                         hard_hit_pct=metrics["hard_hit_pct"],
                         fb_pct=metrics["fb_pct"],
                         batter_vs_ff=metrics["batter_vs_ff"],
+                        form_factor=b_form,
                     )
                 )
 
@@ -852,5 +880,7 @@ def build_batter_slate(slate_date: date | None = None) -> tuple[list[BatterRow],
         pitchers_df=pitchers_df,
         bullpen_by_team=bullpen,
         people=people,
+        batter_form_df=batter_form_df,
+        pitcher_form_df=pitcher_form_df,
     )
     return rows, ctx

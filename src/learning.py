@@ -14,9 +14,12 @@ import pandas as pd
 from .ingestion import MLB_API, _get_json
 from .model import (
     BASE_HR_PA,
+    FACTOR_NAMES,
     WEIGHT_BATTER,
+    WEIGHT_BATTER_FORM,
     WEIGHT_PARK,
     WEIGHT_PITCHER,
+    WEIGHT_PITCHER_FORM,
     WEIGHT_REPERTOIRE,
     WEIGHT_WEATHER,
     ModelParams,
@@ -29,7 +32,17 @@ HISTORY_DIR = ROOT / ".cache" / "history"
 GRADED_PATH = HISTORY_DIR / "graded.parquet"
 MIN_SAMPLES_FIT = 80
 PRIOR_STRENGTH = 200.0  # pseudo-counts blending toward default weights
-FACTOR_COLS = ("batter", "pitcher", "park", "weather", "repertoire")
+FACTOR_COLS = FACTOR_NAMES
+N_FACTORS = len(FACTOR_COLS)
+PRIOR_WEIGHTS = (
+    WEIGHT_BATTER,
+    WEIGHT_PITCHER,
+    WEIGHT_PARK,
+    WEIGHT_WEATHER,
+    WEIGHT_REPERTOIRE,
+    WEIGHT_BATTER_FORM,
+    WEIGHT_PITCHER_FORM,
+)
 
 
 def history_path(slate_date: date) -> Path:
@@ -62,6 +75,8 @@ def save_prediction_history(
                 "factor_park": float(factors.get("park", 1.0)),
                 "factor_weather": float(factors.get("weather", 1.0)),
                 "factor_repertoire": float(factors.get("repertoire", 1.0)),
+                "factor_batter_form": float(factors.get("batter_form", 1.0)),
+                "factor_pitcher_form": float(factors.get("pitcher_form", 1.0)),
                 "n_pa": float(factors.get("n_pa", 4.0)),
                 "logged_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -234,6 +249,18 @@ def grade_pending(through: date | None = None, lookback_days: int = 45) -> tuple
     return dates_done, new_rows
 
 
+def _ensure_factor_columns(graded: pd.DataFrame) -> pd.DataFrame:
+    """Backfill missing form factors as neutral 1.0 for pre-form history."""
+    out = graded.copy()
+    for c in FACTOR_COLS:
+        col = f"factor_{c}"
+        if col not in out.columns:
+            out[col] = 1.0
+        else:
+            out[col] = out[col].fillna(1.0).astype(float)
+    return out
+
+
 def _predict_p(
     factors: np.ndarray,
     n_pa: np.ndarray,
@@ -242,7 +269,7 @@ def _predict_p(
     cal_a: float,
     cal_b: float,
 ) -> np.ndarray:
-    """factors shape (n, 5) raw multipliers; weights sum to 1."""
+    """factors shape (n, k) raw multipliers; weights sum to 1."""
     log_f = np.log(np.clip(factors, 1e-6, None))
     log_blend = log_f @ weights
     multiplier = np.exp(log_blend)
@@ -274,20 +301,17 @@ def fit_params(graded: pd.DataFrame | None = None) -> ModelParams | None:
     if graded.empty or len(graded) < MIN_SAMPLES_FIT:
         return None
 
+    graded = _ensure_factor_columns(graded)
     y = graded["hr_hit"].astype(float).to_numpy()
-    factors = graded[
-        [f"factor_{c}" for c in FACTOR_COLS]
-    ].astype(float).to_numpy()
+    factors = graded[[f"factor_{c}" for c in FACTOR_COLS]].astype(float).to_numpy()
     n_pa = graded["n_pa"].astype(float).to_numpy()
 
-    prior = np.array(
-        [WEIGHT_BATTER, WEIGHT_PITCHER, WEIGHT_PARK, WEIGHT_WEATHER, WEIGHT_REPERTOIRE],
-        dtype=float,
-    )
+    prior = np.array(PRIOR_WEIGHTS, dtype=float)
     prior = prior / prior.sum()
 
     # Unconstrained logits for softmax weights
     w_logits = np.log(prior)
+    k = N_FACTORS
 
     def softmax(z: np.ndarray) -> np.ndarray:
         z = z - np.max(z)
@@ -295,10 +319,10 @@ def fit_params(graded: pd.DataFrame | None = None) -> ModelParams | None:
         return e / e.sum()
 
     def objective(x: np.ndarray) -> float:
-        # x: [5 logits, base_hr_pa, cal_a, cal_b]
-        weights = softmax(x[:5])
-        base = float(np.clip(x[5], 0.015, 0.06))
-        cal_a, cal_b = float(x[6]), float(np.clip(x[7], 0.2, 3.0))
+        # x: [k logits, base_hr_pa, cal_a, cal_b]
+        weights = softmax(x[:k])
+        base = float(np.clip(x[k], 0.015, 0.06))
+        cal_a, cal_b = float(x[k + 1]), float(np.clip(x[k + 2], 0.2, 3.0))
         p = _predict_p(factors, n_pa, weights, base, cal_a, cal_b)
         nll = _log_loss(y, p)
         # Prior pull on weights + base
@@ -333,18 +357,18 @@ def fit_params(graded: pd.DataFrame | None = None) -> ModelParams | None:
             gb = np.sum((p - y) * logit) + 0.01 * (b - 1)
             hb = np.sum(w * logit * logit) + 0.01
             b -= gb / max(hb, 1e-6)
-        x[6], x[7] = a, float(np.clip(b, 0.2, 3.0))
+        x[k + 1], x[k + 2] = a, float(np.clip(b, 0.2, 3.0))
 
-    weights = softmax(x[:5])
+    weights = softmax(x[:k])
     # Blend toward prior based on sample size
     n = float(len(y))
     mix = n / (n + PRIOR_STRENGTH)
     weights = mix * weights + (1.0 - mix) * prior
     weights = weights / weights.sum()
 
-    base = float(np.clip(mix * x[5] + (1.0 - mix) * BASE_HR_PA, 0.015, 0.06))
-    cal_a = float(mix * x[6])
-    cal_b = float(np.clip(mix * x[7] + (1.0 - mix) * 1.0, 0.2, 3.0))
+    base = float(np.clip(mix * x[k] + (1.0 - mix) * BASE_HR_PA, 0.015, 0.06))
+    cal_a = float(mix * x[k + 1])
+    cal_b = float(np.clip(mix * x[k + 2] + (1.0 - mix) * 1.0, 0.2, 3.0))
 
     params = ModelParams(
         base_hr_pa=base,
@@ -353,6 +377,8 @@ def fit_params(graded: pd.DataFrame | None = None) -> ModelParams | None:
         weight_park=float(weights[2]),
         weight_weather=float(weights[3]),
         weight_repertoire=float(weights[4]),
+        weight_batter_form=float(weights[5]),
+        weight_pitcher_form=float(weights[6]),
         cal_a=cal_a,
         cal_b=cal_b,
         n_samples=int(n),

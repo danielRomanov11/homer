@@ -46,18 +46,22 @@ Flow:
 |--------|-----|
 | [MLB Stats API](https://statsapi.mlb.com/api/v1/) | Schedule, lineups, probable pitchers, venues, box scores |
 | [Open-Meteo](https://api.open-meteo.com/) | Game-time temp, wind, humidity |
-| [pybaseball](https://github.com/jldbc/pybaseball) / Baseball Savant | Season barrel / hard-hit contact baselines |
+| [pybaseball](https://github.com/jldbc/pybaseball) / Baseball Savant | Season barrel / hard-hit contact baselines + rolling form |
 | MLB Stats API season pitching | HR/9, IP, GS (opener / bullpen detection) |
 | `data/venues.json` | Park factors, roof type, orientation |
 
-Season metrics cache under `.cache/` and refresh automatically every 24 hours.
+Season metrics cache under `.cache/` and refresh automatically every 24 hours. Form windows cache under `.cache/statcast_months/` and `.cache/form/`.
 
 ## Model (summary)
 
 Weighted blend → per-PA HR chance → game probability \(1-(1-p)^{N_{PA}}\), then optional calibration:
 
-- 35% batter quality of contact (default; learned over time)
-- 25% pitcher HR vulnerability (+ platoon)
-- 20% park / elevation
-- 15% weather (temp + wind vs park azimuth)
+- 30% batter quality of contact (season; default; learned over time)
+- 20% pitcher HR vulnerability (+ platoon)
+- 18% park / elevation
+- 13% weather (temp + wind vs park azimuth)
 - 5% pitch-repertoire matchup when available
+- 7% batter form (last ~35 days barrel / hard-hit / FB, empirical-Bayes shrunk to season)
+- 7% pitcher form (same window: barrels allowed + HR/BBE proxy, shrunk to season)
+
+Form uses Statcast batted balls ending the day before the slate (no leakage). Thin samples stay near 1.0; clamps keep form from dominating.

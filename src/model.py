@@ -16,11 +16,24 @@ PARAMS_PATH = ROOT / "data" / "learned_params.json"
 # League baseline HR per PA (~3.3% — slightly above raw league ~3% for slate UX)
 BASE_HR_PA = 0.033
 
-WEIGHT_BATTER = 0.35
-WEIGHT_PITCHER = 0.25
-WEIGHT_PARK = 0.20
-WEIGHT_WEATHER = 0.15
+# Priors: season talent dominates; form is a small shrunk residual
+WEIGHT_BATTER = 0.30
+WEIGHT_PITCHER = 0.20
+WEIGHT_PARK = 0.18
+WEIGHT_WEATHER = 0.13
 WEIGHT_REPERTOIRE = 0.05
+WEIGHT_BATTER_FORM = 0.07
+WEIGHT_PITCHER_FORM = 0.07
+
+FACTOR_NAMES = (
+    "batter",
+    "pitcher",
+    "park",
+    "weather",
+    "repertoire",
+    "batter_form",
+    "pitcher_form",
+)
 
 
 @dataclass
@@ -31,6 +44,8 @@ class ModelParams:
     weight_park: float = WEIGHT_PARK
     weight_weather: float = WEIGHT_WEATHER
     weight_repertoire: float = WEIGHT_REPERTOIRE
+    weight_batter_form: float = WEIGHT_BATTER_FORM
+    weight_pitcher_form: float = WEIGHT_PITCHER_FORM
     # Platt calibration: sigmoid(a + b * logit(p_raw))
     cal_a: float = 0.0
     cal_b: float = 1.0
@@ -38,16 +53,18 @@ class ModelParams:
     updated_at: str | None = None
     metrics: dict[str, float] = field(default_factory=dict)
 
-    def normalized_weights(self) -> tuple[float, float, float, float, float]:
+    def normalized_weights(self) -> tuple[float, ...]:
         ws = [
             self.weight_batter,
             self.weight_pitcher,
             self.weight_park,
             self.weight_weather,
             self.weight_repertoire,
+            self.weight_batter_form,
+            self.weight_pitcher_form,
         ]
         s = sum(ws) or 1.0
-        return tuple(w / s for w in ws)  # type: ignore[return-value]
+        return tuple(w / s for w in ws)
 
 
 def default_params() -> ModelParams:
@@ -67,6 +84,8 @@ def load_params(path: Path | None = None) -> ModelParams:
             weight_park=float(raw.get("weight_park", WEIGHT_PARK)),
             weight_weather=float(raw.get("weight_weather", WEIGHT_WEATHER)),
             weight_repertoire=float(raw.get("weight_repertoire", WEIGHT_REPERTOIRE)),
+            weight_batter_form=float(raw.get("weight_batter_form", WEIGHT_BATTER_FORM)),
+            weight_pitcher_form=float(raw.get("weight_pitcher_form", WEIGHT_PITCHER_FORM)),
             cal_a=float(raw.get("cal_a", 0.0)),
             cal_b=float(raw.get("cal_b", 1.0)),
             n_samples=int(raw.get("n_samples", 0)),
@@ -87,6 +106,8 @@ def save_params(params: ModelParams, path: Path | None = None) -> Path:
         "weight_park": params.weight_park,
         "weight_weather": params.weight_weather,
         "weight_repertoire": params.weight_repertoire,
+        "weight_batter_form": params.weight_batter_form,
+        "weight_pitcher_form": params.weight_pitcher_form,
         "cal_a": params.cal_a,
         "cal_b": params.cal_b,
         "n_samples": params.n_samples,
@@ -224,13 +245,15 @@ def score_batter(
     params: ModelParams | None = None,
 ) -> Projection:
     params = params or default_params()
-    wb, wp, wpark, ww, wr = params.normalized_weights()
+    wb, wp, wpark, ww, wr, wbf, wpf = params.normalized_weights()
 
     b = _batter_factor(row)
     p = _pitcher_factor(row)
     park = _park_factor(row, venues)
     weather, wind_temp = _weather_factor(row, venues)
     rep = _repertoire_factor(row)
+    b_form = _clamp(float(row.form_factor or 1.0), 0.85, 1.15)
+    p_form = _clamp(float(row.pitcher.form_factor or 1.0), 0.85, 1.15)
 
     log_blend = (
         wb * math.log(b)
@@ -238,6 +261,8 @@ def score_batter(
         + wpark * math.log(park)
         + ww * math.log(weather)
         + wr * math.log(rep)
+        + wbf * math.log(b_form)
+        + wpf * math.log(p_form)
     )
     multiplier = math.exp(log_blend)
     p_hr_pa = _clamp(params.base_hr_pa * multiplier, 0.010, 0.14)
@@ -273,6 +298,8 @@ def score_batter(
             "park": round(park, 3),
             "weather": round(weather, 3),
             "repertoire": round(rep, 3),
+            "batter_form": round(b_form, 3),
+            "pitcher_form": round(p_form, 3),
             "n_pa": n_pa,
         },
     )
