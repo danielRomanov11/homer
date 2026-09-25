@@ -1,0 +1,20 @@
+{
+  "base_hr_pa": 0.033068718819487676,
+  "weight_batter": 0.8427740445500876,
+  "weight_pitcher": 0.045990910967295004,
+  "weight_park": 0.05367286194492225,
+  "weight_weather": 0.03985971032498788,
+  "weight_repertoire": 0.017702472212707106,
+  "cal_a": 0.017579519725433746,
+  "cal_b": 1.035533986720744,
+  "n_samples": 221436,
+  "updated_at": "2026-09-25T21:33:52.269371+00:00",
+  "metrics": {
+    "brier_new": 0.10058,
+    "brier_prior": 0.10103,
+    "logloss_new": 0.35092,
+    "logloss_prior": 0.35328,
+    "hr_rate": 0.1151,
+    "mean_p_new": 0.1147
+  }
+}

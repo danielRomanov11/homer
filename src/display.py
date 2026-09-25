@@ -110,6 +110,7 @@ def export_csv(projections: list[Projection], slate_date: date) -> Path:
         df = pd.concat([df.drop(columns=["factors"]), factors], axis=1)
     cols = [
         "rank",
+        "player_id",
         "player",
         "team",
         "opp",

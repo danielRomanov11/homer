@@ -65,6 +65,17 @@
     "hr_factor_lhb": 0.92,
     "hr_factor_rhb": 0.94
   },
+  "10": {
+    "name": "Oakland Coliseum",
+    "team": "OAK",
+    "lat": 37.751511,
+    "lon": -122.200698,
+    "elevation_ft": 10,
+    "azimuth_deg": 55.0,
+    "roof": "open",
+    "hr_factor_lhb": 0.92,
+    "hr_factor_rhb": 0.94
+  },
   "12": {
     "name": "Tropicana Field",
     "team": "TB",

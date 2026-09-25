@@ -22,9 +22,16 @@ BULLPEN_CACHE = CACHE_DIR / "bullpen_season.parquet"
 
 MLB_API = "https://statsapi.mlb.com/api/v1"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 CACHE_TTL_HOURS = 24
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "homer-hr-predictor/1.0"})
+_WEATHER_MEMO: dict[tuple, Weather] = {}
+_WEATHER_DISK = CACHE_DIR / "weather"
+_LAST_ARCHIVE_FETCH = 0.0
+_ARCHIVE_MIN_INTERVAL_SEC = 2.0
+_ARCHIVE_COOLDOWN_UNTIL = 0.0
+_ARCHIVE_COOLDOWN_SEC = 90.0
 
 
 @dataclass
@@ -83,15 +90,50 @@ class SlateContext:
 
 def _get_json(url: str, params: dict | None = None, retries: int = 3) -> dict:
     last_err: Exception | None = None
+    is_archive = "archive-api.open-meteo" in url
     for attempt in range(retries):
         try:
             resp = SESSION.get(url, params=params, timeout=45)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else (4.0 * (2**attempt))
+                except ValueError:
+                    wait = 4.0 * (2**attempt)
+                # Archive free tier: fail fast so backfill can use neutral weather
+                wait = min(max(wait, 2.0), 20.0 if is_archive else 45.0)
+                time.sleep(wait)
+                last_err = RuntimeError(f"429 Too Many Requests (waited {wait:.0f}s)")
+                continue
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"Failed GET {url}: {last_err}")
+
+
+def _throttle_archive() -> None:
+    global _LAST_ARCHIVE_FETCH
+    elapsed = time.time() - _LAST_ARCHIVE_FETCH
+    if elapsed < _ARCHIVE_MIN_INTERVAL_SEC:
+        time.sleep(_ARCHIVE_MIN_INTERVAL_SEC - elapsed)
+    _LAST_ARCHIVE_FETCH = time.time()
+
+
+def _archive_cooling_down() -> bool:
+    return time.time() < _ARCHIVE_COOLDOWN_UNTIL
+
+
+def _trip_archive_cooldown() -> None:
+    global _ARCHIVE_COOLDOWN_UNTIL
+    _ARCHIVE_COOLDOWN_UNTIL = time.time() + _ARCHIVE_COOLDOWN_SEC
+
+
+def _weather_disk_path(lat: float, lon: float, day: date, archive: bool) -> Path:
+    _WEATHER_DISK.mkdir(parents=True, exist_ok=True)
+    kind = "a" if archive else "f"
+    return _WEATHER_DISK / f"{kind}_{lat:.3f}_{lon:.3f}_{day.isoformat()}.json"
 
 
 def load_venues() -> dict[str, Any]:
@@ -105,11 +147,36 @@ def current_season(today: date | None = None) -> int:
     return today.year if today.month >= 3 else today.year - 1
 
 
-def _cache_fresh() -> bool:
-    if not (BATTERS_CACHE.exists() and PITCHERS_CACHE.exists() and CACHE_META.exists()):
+def baseline_season_for(slate_date: date) -> int:
+    """
+    Season year for Statcast/pitching baselines.
+    Historical slates use the prior completed season to avoid same-year leakage.
+    Live/today uses the current season.
+    """
+    if slate_date >= date.today():
+        return current_season(slate_date)
+    # Prior calendar year's MLB season (e.g. 2022-06-15 -> 2021)
+    return slate_date.year - 1
+
+
+def _season_cache_paths(season: int) -> tuple[Path, Path, Path, Path]:
+    return (
+        CACHE_DIR / f"batters_{season}.parquet",
+        CACHE_DIR / f"pitchers_{season}.parquet",
+        CACHE_DIR / f"bullpen_{season}.parquet",
+        CACHE_DIR / f"statcast_meta_{season}.json",
+    )
+
+
+def _cache_fresh(season: int) -> bool:
+    batters_p, pitchers_p, _bull_p, meta_p = _season_cache_paths(season)
+    if not (batters_p.exists() and pitchers_p.exists() and meta_p.exists()):
         return False
+    # Completed seasons (older than current) are immutable once cached
+    if season < current_season():
+        return True
     try:
-        meta = json.loads(CACHE_META.read_text(encoding="utf-8"))
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
         fetched = datetime.fromisoformat(meta["fetched_at"])
         return datetime.now(timezone.utc) - fetched < timedelta(hours=CACHE_TTL_HOURS)
     except Exception:  # noqa: BLE001
@@ -177,6 +244,26 @@ def _team_id_abbrev_map(season: int) -> dict[int, str]:
     }
 
 
+def _safe_float(val: Any, default: float = float("nan")) -> float:
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_innings_pitched(ip_raw: Any) -> float:
+    try:
+        ip_s = str(ip_raw)
+        if "." in ip_s:
+            whole, frac = ip_s.split(".", 1)
+            return float(whole) + (int(frac) / 3.0)
+        return float(ip_s)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _mlb_pitching_season(season: int) -> pd.DataFrame:
     """Season pitching lines from MLB Stats API (HR/9, IP, GS) — no FanGraphs."""
     data = _get_json(
@@ -198,39 +285,29 @@ def _mlb_pitching_season(season: int) -> pd.DataFrame:
         stat = split.get("stat") or {}
         team_id = team.get("id")
         abbrev = team.get("abbreviation") or (team_map.get(int(team_id)) if team_id else None) or "?"
-        ip_raw = stat.get("inningsPitched", "0")
-        try:
-            # MLB uses "123.1" / "123.2" outs notation
-            ip_s = str(ip_raw)
-            if "." in ip_s:
-                whole, frac = ip_s.split(".", 1)
-                ip = float(whole) + (int(frac) / 3.0)
-            else:
-                ip = float(ip_s)
-        except ValueError:
-            ip = 0.0
         rows.append(
             {
                 "player_id": int(player["id"]) if player.get("id") else None,
                 "name": player.get("fullName", ""),
                 "team": abbrev,
-                "hr9": float(stat.get("homeRunsPer9") or 0) if stat.get("homeRunsPer9") not in (None, "") else float("nan"),
-                "gs": float(stat.get("gamesStarted") or 0),
-                "ip": ip,
-                "ff_usage": 40.0,  # repertoire detail not in this endpoint; model treats as neutral band
+                "hr9": _safe_float(stat.get("homeRunsPer9")),
+                "gs": _safe_float(stat.get("gamesStarted"), 0.0),
+                "ip": _parse_innings_pitched(stat.get("inningsPitched", "0")),
+                "ff_usage": 40.0,
             }
         )
     return pd.DataFrame(rows)
 
 
 def refresh_statcast_cache(season: int | None = None, force: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, float]]]:
-    """Load or refresh season batter/pitcher baselines (24h TTL)."""
+    """Load or refresh season batter/pitcher baselines (per-season files; 24h TTL for current)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     season = season or current_season()
+    batters_p, pitchers_p, bullpen_p, meta_p = _season_cache_paths(season)
 
-    if not force and _cache_fresh():
-        batters = pd.read_parquet(BATTERS_CACHE)
-        pitchers = pd.read_parquet(PITCHERS_CACHE)
+    if not force and _cache_fresh(season):
+        batters = pd.read_parquet(batters_p)
+        pitchers = pd.read_parquet(pitchers_p)
         bullpen = _bullpen_from_pitchers(pitchers)
         return batters, pitchers, bullpen
 
@@ -256,12 +333,21 @@ def refresh_statcast_cache(season: int | None = None, force: bool = False) -> tu
     pitchers["fb_pct"] = pitchers["fb_pct"].fillna(35.0)
     pitchers["ff_usage"] = pitchers["ff_usage"].fillna(40.0)
 
-    batters.to_parquet(BATTERS_CACHE, index=False)
-    pitchers.to_parquet(PITCHERS_CACHE, index=False)
+    batters.to_parquet(batters_p, index=False)
+    pitchers.to_parquet(pitchers_p, index=False)
     bullpen = _bullpen_from_pitchers(pitchers)
-    pd.DataFrame([{"team": k, **v} for k, v in bullpen.items()]).to_parquet(BULLPEN_CACHE, index=False)
+    pd.DataFrame([{"team": k, **v} for k, v in bullpen.items()]).to_parquet(bullpen_p, index=False)
 
-    CACHE_META.write_text(
+    # Also mirror to legacy paths for current season (compat)
+    if season == current_season():
+        batters.to_parquet(BATTERS_CACHE, index=False)
+        pitchers.to_parquet(PITCHERS_CACHE, index=False)
+        CACHE_META.write_text(
+            json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "season": season}),
+            encoding="utf-8",
+        )
+
+    meta_p.write_text(
         json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "season": season}),
         encoding="utf-8",
     )
@@ -291,19 +377,40 @@ def _bullpen_from_pitchers(pitchers: pd.DataFrame) -> dict[str, dict[str, float]
     return out
 
 
-def fetch_schedule(slate_date: date) -> list[dict[str, Any]]:
-    data = _get_json(
-        f"{MLB_API}/schedule",
-        params={
-            "sportId": 1,
-            "date": slate_date.isoformat(),
-            "hydrate": "lineups,probablePitcher(note),venue,weather,team",
-        },
-    )
+def fetch_schedule(slate_date: date, game_types: str = "R") -> list[dict[str, Any]]:
+    params: dict[str, Any] = {
+        "sportId": 1,
+        "date": slate_date.isoformat(),
+        "hydrate": "lineups,probablePitcher(note),venue,weather,team",
+    }
+    if game_types:
+        params["gameTypes"] = game_types
+    data = _get_json(f"{MLB_API}/schedule", params=params)
     games: list[dict[str, Any]] = []
     for d in data.get("dates", []):
         games.extend(d.get("games", []))
     return games
+
+
+def iter_schedule_dates(start: date, end: date, game_types: str = "R") -> list[date]:
+    """Return dates in [start, end] that have at least one regular-season game."""
+    data = _get_json(
+        f"{MLB_API}/schedule",
+        params={
+            "sportId": 1,
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+            "gameTypes": game_types,
+        },
+    )
+    out: list[date] = []
+    for d in data.get("dates", []):
+        if d.get("games"):
+            try:
+                out.append(date.fromisoformat(d["date"]))
+            except ValueError:
+                continue
+    return out
 
 
 def fetch_people(person_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -329,47 +436,100 @@ def fetch_weather(
     if indoors:
         return Weather(temp_f=72.0, humidity=45.0, wind_mph=0.0, wind_dir_deg=0.0, indoors=True)
 
-    data = _get_json(
-        OPEN_METEO,
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability",
-            "temperature_unit": "fahrenheit",
-            "wind_speed_unit": "mph",
-            "timezone": "auto",
-            "forecast_days": 3,
-        },
-    )
-    hourly = data.get("hourly", {})
+    local_dt = game_time.astimezone().replace(tzinfo=None) if game_time.tzinfo else game_time
+    day = local_dt.date() if hasattr(local_dt, "date") else date.today()
+    memo_key = (round(lat, 3), round(lon, 3), day.isoformat(), local_dt.hour)
+    if memo_key in _WEATHER_MEMO:
+        return _WEATHER_MEMO[memo_key]
+
+    use_archive = day < (date.today() - timedelta(days=2))
+    disk = _weather_disk_path(round(lat, 3), round(lon, 3), day, archive=use_archive)
+    data: dict[str, Any] | None = None
+    if disk.exists():
+        try:
+            data = json.loads(disk.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+
+    if data is None:
+        try:
+            if use_archive:
+                if _archive_cooling_down():
+                    raise RuntimeError("archive cooldown after 429")
+                _throttle_archive()
+                data = _get_json(
+                    OPEN_METEO_ARCHIVE,
+                    params={
+                        "latitude": lat,
+                        "longitude": lon,
+                        "start_date": day.isoformat(),
+                        "end_date": day.isoformat(),
+                        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation",
+                        "temperature_unit": "fahrenheit",
+                        "wind_speed_unit": "mph",
+                        "timezone": "auto",
+                    },
+                    retries=1,
+                )
+            else:
+                data = _get_json(
+                    OPEN_METEO,
+                    params={
+                        "latitude": lat,
+                        "longitude": lon,
+                        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability",
+                        "temperature_unit": "fahrenheit",
+                        "wind_speed_unit": "mph",
+                        "timezone": "auto",
+                        "forecast_days": 3,
+                    },
+                    retries=2,
+                )
+            try:
+                disk.write_text(json.dumps(data), encoding="utf-8")
+            except Exception:
+                pass
+        except Exception as exc:
+            if use_archive and ("429" in str(exc) or "cooldown" in str(exc).lower()):
+                _trip_archive_cooldown()
+            # Don't fail the slate on weather outages / rate limits
+            weather = Weather(temp_f=72.0, humidity=50.0, wind_mph=5.0, wind_dir_deg=0.0)
+            _WEATHER_MEMO[memo_key] = weather
+            return weather
+
+    hourly = (data or {}).get("hourly", {})
     times = hourly.get("time", [])
     if not times:
-        return Weather(temp_f=72.0, humidity=50.0, wind_mph=5.0, wind_dir_deg=0.0)
+        weather = Weather(temp_f=72.0, humidity=50.0, wind_mph=5.0, wind_dir_deg=0.0)
+        _WEATHER_MEMO[memo_key] = weather
+        return weather
 
-    # Match closest local hour string
-    target = game_time.astimezone().replace(tzinfo=None) if game_time.tzinfo else game_time
-    target_str = target.strftime("%Y-%m-%dT%H:00")
+    target_str = local_dt.strftime("%Y-%m-%dT%H:00")
     if target_str in times:
         idx = times.index(target_str)
     else:
-        # nearest by parsing
         best_i, best_diff = 0, float("inf")
         for i, t in enumerate(times):
             try:
                 dt = datetime.fromisoformat(t)
             except ValueError:
                 continue
-            diff = abs((dt - target.replace(tzinfo=None)).total_seconds())
+            diff = abs((dt - local_dt.replace(tzinfo=None)).total_seconds())
             if diff < best_diff:
                 best_diff, best_i = diff, i
         idx = best_i
 
-    precip = hourly.get("precipitation_probability", [0] * len(times))
     rain = False
-    try:
-        rain = float(precip[idx] or 0) >= 60
-    except (TypeError, ValueError, IndexError):
-        rain = False
+    if "precipitation_probability" in hourly:
+        try:
+            rain = float(hourly["precipitation_probability"][idx] or 0) >= 60
+        except (TypeError, ValueError, IndexError):
+            rain = False
+    elif "precipitation" in hourly:
+        try:
+            rain = float(hourly["precipitation"][idx] or 0) >= 1.0
+        except (TypeError, ValueError, IndexError):
+            rain = False
 
     def _at(key: str, default: float) -> float:
         vals = hourly.get(key, [])
@@ -378,7 +538,7 @@ def fetch_weather(
         except (TypeError, ValueError, IndexError):
             return default
 
-    return Weather(
+    weather = Weather(
         temp_f=_at("temperature_2m", 72.0),
         humidity=_at("relative_humidity_2m", 50.0),
         wind_mph=_at("wind_speed_10m", 5.0),
@@ -386,6 +546,8 @@ def fetch_weather(
         indoors=False,
         rain_risk=rain,
     )
+    _WEATHER_MEMO[memo_key] = weather
+    return weather
 
 
 def _team_abbrev(team_obj: dict) -> str:
@@ -571,7 +733,8 @@ def _batter_metrics(player_id: int, batters_df: pd.DataFrame) -> dict[str, float
 def build_batter_slate(slate_date: date | None = None) -> tuple[list[BatterRow], SlateContext]:
     slate_date = slate_date or date.today()
     venues = load_venues()
-    batters_df, pitchers_df, bullpen = refresh_statcast_cache(current_season(slate_date))
+    bas_season = baseline_season_for(slate_date)
+    batters_df, pitchers_df, bullpen = refresh_statcast_cache(bas_season)
     games = fetch_schedule(slate_date)
 
     # Collect ids for people hydrate
