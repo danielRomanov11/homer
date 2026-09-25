@@ -1,0 +1,8 @@
+pybaseball>=2.2.7
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+rich>=13.0.0
+pyarrow>=14.0.0
+lxml>=4.9.0
+html5lib>=1.1
