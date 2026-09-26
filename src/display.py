@@ -48,6 +48,7 @@ def render_table(
     n_games: int,
     csv_path: Path | None = None,
     top_n: int = 25,
+    core_n: int = 4,
 ) -> None:
     console = Console(force_terminal=True)
     width = 108
@@ -80,16 +81,24 @@ def render_table(
             f"{_fmt(p.wind_temp, 14)}  "
             f"{p.p_hr * 100:5.1f}%"
         )
-        if p.rain_risk:
-            console.print(f"[yellow]{line}[/yellow]")
-        elif p.p_hr >= 0.22:
+        if p.rank <= core_n:
+            # Core board: historically ~25–27% HR rate vs ~11% slate base
             console.print(f"[bold green]{line}[/bold green]")
+        elif p.rain_risk:
+            console.print(f"[yellow]{line}[/yellow]")
         elif p.p_hr >= 0.16:
             console.print(f"[green]{line}[/green]")
         else:
             console.print(line)
 
     console.print("-" * width)
+    core = projections[:core_n]
+    if core:
+        core_names = ", ".join(p.player.replace("*", "") for p in core)
+        console.print(
+            f"[bold]CORE {core_n}:[/bold] {core_names}  "
+            f"[dim](lean here — top-4 hits ~22–24% historically vs ~19–20% for top-8)[/dim]"
+        )
     console.print(f"[+] Processed {n_games} games, {len(projections)} batters.")
     if csv_path:
         try:

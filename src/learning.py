@@ -24,6 +24,7 @@ from .model import (
     WEIGHT_WEATHER,
     ModelParams,
     Projection,
+    project_weights,
     save_params,
 )
 
@@ -31,7 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
 HISTORY_DIR = ROOT / ".cache" / "history"
 GRADED_PATH = HISTORY_DIR / "graded.parquet"
 MIN_SAMPLES_FIT = 80
-PRIOR_STRENGTH = 200.0  # pseudo-counts blending toward default weights
+# Pseudo-counts toward priors. Must stay meaningful even with 200k+ rows —
+# otherwise softmax fit collapses onto batter and kills top-K ranking.
+PRIOR_STRENGTH = 50_000.0
+# Cap how far learned weights may drift from priors (matchup-aware board)
+MAX_LEARN_MIX = 0.45
 FACTOR_COLS = FACTOR_NAMES
 N_FACTORS = len(FACTOR_COLS)
 PRIOR_WEIGHTS = (
@@ -360,11 +365,11 @@ def fit_params(graded: pd.DataFrame | None = None) -> ModelParams | None:
         x[k + 1], x[k + 2] = a, float(np.clip(b, 0.2, 3.0))
 
     weights = softmax(x[:k])
-    # Blend toward prior based on sample size
+    # Blend toward prior; cap mix so large history cannot erase matchup priors
     n = float(len(y))
-    mix = n / (n + PRIOR_STRENGTH)
+    mix = min(MAX_LEARN_MIX, n / (n + PRIOR_STRENGTH))
     weights = mix * weights + (1.0 - mix) * prior
-    weights = weights / weights.sum()
+    weights = np.array(project_weights(tuple(float(v) for v in weights)), dtype=float)
 
     base = float(np.clip(mix * x[k] + (1.0 - mix) * BASE_HR_PA, 0.015, 0.06))
     cal_a = float(mix * x[k + 1])
@@ -383,7 +388,7 @@ def fit_params(graded: pd.DataFrame | None = None) -> ModelParams | None:
         cal_b=cal_b,
         n_samples=int(n),
         updated_at=datetime.now(timezone.utc).isoformat(),
-    )
+    ).with_projected_weights()
 
     # Metrics for reporting (stored on params via save sidecar optional)
     p_new = _predict_p(factors, n_pa, weights, base, cal_a, cal_b)

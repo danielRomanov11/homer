@@ -16,14 +16,36 @@ PARAMS_PATH = ROOT / "data" / "learned_params.json"
 # League baseline HR per PA (~3.3% — slightly above raw league ~3% for slate UX)
 BASE_HR_PA = 0.033
 
-# Priors: season talent dominates; form is a small shrunk residual
-WEIGHT_BATTER = 0.30
-WEIGHT_PITCHER = 0.20
-WEIGHT_PARK = 0.18
-WEIGHT_WEATHER = 0.13
-WEIGHT_REPERTOIRE = 0.05
+# Priors: power talent first (drives top-K hit rate), then pitcher/park, then form.
+# Equal batter/pitcher weights looked principled but lost ~3–4pp on 21-day top-8.
+WEIGHT_BATTER = 0.45
+WEIGHT_PITCHER = 0.22
+WEIGHT_PARK = 0.12
+WEIGHT_WEATHER = 0.07
+WEIGHT_REPERTOIRE = 0.03
 WEIGHT_BATTER_FORM = 0.07
-WEIGHT_PITCHER_FORM = 0.07
+WEIGHT_PITCHER_FORM = 0.04
+
+# Floors/caps after load + learning. Stop the ~85%-batter collapse without
+# forcing an equal matchup blend that underperformed chalk on recent boards.
+WEIGHT_FLOOR = {
+    "batter": 0.32,
+    "pitcher": 0.12,
+    "park": 0.08,
+    "weather": 0.04,
+    "repertoire": 0.02,
+    "batter_form": 0.04,
+    "pitcher_form": 0.03,
+}
+WEIGHT_CAP = {
+    "batter": 0.58,
+    "pitcher": 0.32,
+    "park": 0.22,
+    "weather": 0.14,
+    "repertoire": 0.06,
+    "batter_form": 0.12,
+    "pitcher_form": 0.10,
+}
 
 FACTOR_NAMES = (
     "batter",
@@ -34,6 +56,25 @@ FACTOR_NAMES = (
     "batter_form",
     "pitcher_form",
 )
+
+
+def project_weights(weights: list[float] | tuple[float, ...]) -> tuple[float, ...]:
+    """Project onto capped/floored simplex so matchup signals can't vanish."""
+    names = FACTOR_NAMES
+    w = [float(x) for x in weights]
+    if len(w) != len(names):
+        raise ValueError(f"expected {len(names)} weights, got {len(w)}")
+    for _ in range(8):
+        for i, name in enumerate(names):
+            w[i] = max(WEIGHT_FLOOR[name], min(WEIGHT_CAP[name], w[i]))
+        s = sum(w) or 1.0
+        w = [x / s for x in w]
+        # If renorm pushed anyone under floor, loop again
+        if all(w[i] + 1e-9 >= WEIGHT_FLOOR[names[i]] for i in range(len(names))):
+            if all(w[i] - 1e-9 <= WEIGHT_CAP[names[i]] for i in range(len(names))):
+                break
+    s = sum(w) or 1.0
+    return tuple(x / s for x in w)
 
 
 @dataclass
@@ -54,17 +95,36 @@ class ModelParams:
     metrics: dict[str, float] = field(default_factory=dict)
 
     def normalized_weights(self) -> tuple[float, ...]:
-        ws = [
-            self.weight_batter,
-            self.weight_pitcher,
-            self.weight_park,
-            self.weight_weather,
-            self.weight_repertoire,
-            self.weight_batter_form,
-            self.weight_pitcher_form,
-        ]
-        s = sum(ws) or 1.0
-        return tuple(w / s for w in ws)
+        return project_weights(
+            [
+                self.weight_batter,
+                self.weight_pitcher,
+                self.weight_park,
+                self.weight_weather,
+                self.weight_repertoire,
+                self.weight_batter_form,
+                self.weight_pitcher_form,
+            ]
+        )
+
+    def with_projected_weights(self) -> ModelParams:
+        """Return a copy with floors/caps applied to stored weights."""
+        w = self.normalized_weights()
+        return ModelParams(
+            base_hr_pa=self.base_hr_pa,
+            weight_batter=float(w[0]),
+            weight_pitcher=float(w[1]),
+            weight_park=float(w[2]),
+            weight_weather=float(w[3]),
+            weight_repertoire=float(w[4]),
+            weight_batter_form=float(w[5]),
+            weight_pitcher_form=float(w[6]),
+            cal_a=self.cal_a,
+            cal_b=self.cal_b,
+            n_samples=self.n_samples,
+            updated_at=self.updated_at,
+            metrics=dict(self.metrics),
+        )
 
 
 def default_params() -> ModelParams:
@@ -77,7 +137,7 @@ def load_params(path: Path | None = None) -> ModelParams:
         return default_params()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        return ModelParams(
+        params = ModelParams(
             base_hr_pa=float(raw.get("base_hr_pa", BASE_HR_PA)),
             weight_batter=float(raw.get("weight_batter", WEIGHT_BATTER)),
             weight_pitcher=float(raw.get("weight_pitcher", WEIGHT_PITCHER)),
@@ -92,6 +152,8 @@ def load_params(path: Path | None = None) -> ModelParams:
             updated_at=raw.get("updated_at"),
             metrics=dict(raw.get("metrics") or {}),
         )
+        # Always enforce floors — old fits collapsed batter to ~85%
+        return params.with_projected_weights()
     except Exception:  # noqa: BLE001
         return default_params()
 
@@ -305,16 +367,48 @@ def score_batter(
     )
 
 
+def dedupe_board(projections: list[Projection]) -> list[Projection]:
+    """
+    One row per player for the daily board.
+    Keeps the highest p_hr (best game in a doubleheader); prefers confirmed lineups on ties.
+    Full multi-game rows remain available via the unscored slate for learning.
+    """
+    best: dict[int, Projection] = {}
+    for p in projections:
+        prev = best.get(p.player_id)
+        if prev is None:
+            best[p.player_id] = p
+            continue
+        if p.p_hr > prev.p_hr + 1e-9:
+            best[p.player_id] = p
+        elif abs(p.p_hr - prev.p_hr) <= 1e-9 and prev.projected_lineup and not p.projected_lineup:
+            best[p.player_id] = p
+    out = list(best.values())
+    out.sort(key=lambda x: x.p_hr, reverse=True)
+    for i, proj in enumerate(out, start=1):
+        proj.rank = i
+    return out
+
+
 def score_slate(
     rows: list[BatterRow],
     ctx: SlateContext,
     params: ModelParams | None = None,
+    *,
+    board_dedupe: bool = True,
 ) -> list[Projection]:
     params = params or load_params()
     projections = [score_batter(r, ctx.venues, params=params) for r in rows]
+    # Small uncertainty haircut for projected lineups (slot / PA less reliable)
+    for p in projections:
+        if p.projected_lineup:
+            p.p_hr = _clamp(p.p_hr * 0.97, 0.02, 0.45)
     projections.sort(key=lambda x: x.p_hr, reverse=True)
-    for i, proj in enumerate(projections, start=1):
-        proj.rank = i
+    if board_dedupe:
+        projections = dedupe_board(projections)
+    else:
+        for i, proj in enumerate(projections, start=1):
+            proj.rank = i
     return projections
 
 

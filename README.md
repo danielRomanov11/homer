@@ -56,12 +56,14 @@ Season metrics cache under `.cache/` and refresh automatically every 24 hours. F
 
 Weighted blend → per-PA HR chance → game probability \(1-(1-p)^{N_{PA}}\), then optional calibration:
 
-- 30% batter quality of contact (season; default; learned over time)
-- 20% pitcher HR vulnerability (+ platoon)
-- 18% park / elevation
-- 13% weather (temp + wind vs park azimuth)
-- 5% pitch-repertoire matchup when available
-- 7% batter form (last ~35 days barrel / hard-hit / FB, empirical-Bayes shrunk to season)
-- 7% pitcher form (same window: barrels allowed + HR/BBE proxy, shrunk to season)
+- 45% batter quality of contact (season) — primary driver of top-K hit rate
+- 22% pitcher HR vulnerability (+ platoon)
+- 12% park / elevation
+- 7% weather
+- 7% batter form (last ~35 days, EB-shrunk)
+- 4% pitcher form
+- 3% pitch-repertoire matchup
 
-Form uses Statcast batted balls ending the day before the slate (no leakage). Thin samples stay near 1.0; clamps keep form from dominating.
+Learning may nudge weights, but floors/caps block the old ~85%-batter collapse. The board dedupes doubleheaders (one row per player), discounts projected lineups, and highlights a **CORE 4** (historically ~22–24% HR rate vs ~19–20% for top-8 / ~11% slate base).
+
+Form uses Statcast batted balls ending the day before the slate (no leakage). Thin samples stay near 1.0.
